@@ -55,8 +55,7 @@ var _ requestcontrol.PreRequest = &Producer{}
 type speculativeEntries struct {
 	perPromptKeys [][]kvblock.BlockHash
 	podEntries    []kvblock.PodEntry
-	// released is set once the leases are dropped, so a record replaced under
-	// a repeated request ID is not released again by its eviction callback.
+	// released prevents a record from dropping its leases more than once.
 	// Guarded by speculativeLeases.mu.
 	released bool
 }
@@ -294,7 +293,8 @@ func buildSpeculativeCache(ctx context.Context, config PluginConfig,
 	) {
 		leases.mu.Lock()
 		defer leases.mu.Unlock()
-		leases.release(ctx, item.Key(), item.Value(), reason == ttlcache.EvictionReasonExpired)
+		leases.release(ctx, item.Key(), item.Value(),
+			reason == ttlcache.EvictionReasonExpired || reason == ttlcache.EvictionReasonDeleted)
 	})
 	go cache.Start()
 	go func() {
@@ -398,13 +398,9 @@ func (p *Producer) PreRequest(ctx context.Context,
 		podEntries:    allPodEntries,
 	}
 	p.speculativeLeases.acquire(entries)
-	// Set replaces a record under a repeated request ID without an eviction
-	// callback, so release the replaced record here, after acquiring the new
-	// one so rows both hold stay in the index.
-	if prev := p.speculativeCache.Get(request.RequestID,
-		ttlcache.WithDisableTouchOnHit[string, *speculativeEntries]()); prev != nil {
-		p.speculativeLeases.release(ctx, request.RequestID, prev.Value(), true)
-	}
+	// Delete also finds expired records that Get skips. Its eviction callback
+	// releases the old leases after the new leases protect any shared rows.
+	p.speculativeCache.Delete(request.RequestID)
 	p.speculativeCache.Set(request.RequestID, entries, p.speculativeTTL)
 
 	logger.V(logging.TRACE).Info("Added speculative entries",

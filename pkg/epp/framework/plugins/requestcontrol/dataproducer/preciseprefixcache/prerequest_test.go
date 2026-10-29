@@ -1109,10 +1109,26 @@ func TestSpeculativeTTLExpiry_KeepsEntryOfLiveRequest(t *testing.T) {
 	})
 }
 
-// A request ID can repeat (it comes from the client's x-request-id). Seeding
-// it again replaces its TTL record without an eviction callback, so the rows
-// only the earlier seeding held must not outlive the replaced record.
+// A request ID can repeat (it comes from the client's x-request-id). Replacement
+// must release the old record's leases while retaining rows held by the new one.
 func TestSpeculativeTTLExpiry_RepeatedRequestIDEvictsReplacedRows(t *testing.T) {
+	testRepeatedRequestID(t, 50*time.Millisecond, false)
+}
+
+func TestSpeculativeTTLExpiry_RepeatedRequestIDReleasesUnsweptRows(t *testing.T) {
+	for _, shared := range []bool{false, true} {
+		name := "different rows"
+		if shared {
+			name = "shared rows"
+		}
+		t.Run(name, func(t *testing.T) {
+			testRepeatedRequestID(t, 250*time.Millisecond, shared)
+		})
+	}
+}
+
+func testRepeatedRequestID(t *testing.T, delay time.Duration, shared bool) {
+	t.Helper()
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(utils.NewTestContext(t))
 		defer func() {
@@ -1123,9 +1139,16 @@ func TestSpeculativeTTLExpiry_RepeatedRequestIDEvictsReplacedRows(t *testing.T) 
 		idx, err := kvblock.NewInMemoryIndex(kvblock.DefaultInMemoryIndexConfig())
 		require.NoError(t, err)
 		p := newSpeculativeTTLProducer(ctx, t, "200ms", idx)
+		synctest.Wait()
+		// Keep expired records in the cache until replacement or explicit cleanup.
+		p.speculativeCache.Stop()
+		synctest.Wait()
 
 		first := []kvblock.BlockHash{0x1, 0x2}
 		second := []kvblock.BlockHash{0x3, 0x4}
+		if shared {
+			second = first
+		}
 		seed := func(keys []kvblock.BlockHash) {
 			p.pluginState.Write("dup", blockKeysStateKey, &blockKeysState{perPromptKeys: [][]kvblock.BlockHash{keys}})
 			require.NoError(t, p.PreRequest(ctx, &scheduling.InferenceRequest{RequestID: "dup"},
@@ -1139,9 +1162,19 @@ func TestSpeculativeTTLExpiry_RepeatedRequestIDEvictsReplacedRows(t *testing.T) 
 		}
 
 		seed(first)
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(delay)
+		if delay > p.speculativeTTL {
+			require.False(t, p.speculativeCache.Has("dup"))
+			assert.Equal(t, len(first), chain(first), "expired rows have not been swept")
+		}
 		seed(second)
+		assert.Equal(t, len(second), chain(second), "replacement rows must remain live")
+		if !shared {
+			assert.Zero(t, chain(first), "replacement must release the old rows")
+		}
 		time.Sleep(300 * time.Millisecond)
+		p.speculativeCache.DeleteExpired()
+		synctest.Wait()
 		require.False(t, p.speculativeCache.Has("dup"))
 		assert.Zero(t, chain(first), "rows of the replaced record outlived it")
 		assert.Zero(t, chain(second))
